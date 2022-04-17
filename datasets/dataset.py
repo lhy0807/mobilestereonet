@@ -2,6 +2,7 @@ import os
 import random
 import numpy as np
 from PIL import Image
+import torch
 from torch.utils.data import Dataset
 from .data_io import get_transform, read_all_lines, pfm_imread
 
@@ -75,6 +76,153 @@ class SceneFlowDataset(Dataset):
                     "right_pad": 0,
                     "left_filename": self.left_filenames[index]}
 
+class VoxelDataset(Dataset):
+
+    def __init__(self, datapath, list_filename, training):
+        self.datapath = datapath
+        self.left_filenames, self.right_filenames, self.disp_filenames = self.load_path(list_filename)
+        self.training = training
+
+        # Camera intrinsics
+        # 15mm images have different focals
+        self.c_u = 479.5
+        self.c_v = 269.5
+        self.f_u = 1050.0
+        self.f_v = 1050.0
+        self.baseline = 0.1
+        self.voxel_size = 0.05
+
+
+    def load_path(self, list_filename):
+        lines = read_all_lines(list_filename)
+        splits = [line.split() for line in lines]
+        left_images = [x[0] for x in splits]
+        right_images = [x[1] for x in splits]
+        disp_images = [x[2] for x in splits]
+        return left_images, right_images, disp_images
+
+    def load_image(self, filename):
+        return Image.open(filename).convert('RGB')
+
+    def load_disp(self, filename):
+        data, scale = pfm_imread(filename)
+        data = np.ascontiguousarray(data, dtype=np.float32)
+        return data
+    def project_image_to_rect(self, uv_depth):
+        ''' Input: nx3 first two channels are uv, 3rd channel
+                is depth in rect camera coord.
+            Output: nx3 points in rect camera coord.
+        '''
+        n = uv_depth.shape[0]
+        x = ((uv_depth[:, 0] - self.c_u) * uv_depth[:, 2]) / self.f_u + self.baseline
+        y = ((uv_depth[:, 1] - self.c_v) * uv_depth[:, 2]) / self.f_v
+        pts_3d_rect = np.zeros((n, 3))
+        pts_3d_rect[:, 0] = x
+        pts_3d_rect[:, 1] = y
+        pts_3d_rect[:, 2] = uv_depth[:, 2]
+        return pts_3d_rect
+
+    def project_image_to_velo(self, uv_depth):
+        pts_3d_rect = self.project_image_to_rect(uv_depth)
+        return pts_3d_rect
+
+    def calc_cloud(self, disp_est, depth):
+        mask = disp_est > 0
+        rows, cols = depth.shape
+        c, r = np.meshgrid(np.arange(cols), np.arange(rows))
+        points = np.stack([c, r, depth])
+        points = points.reshape((3, -1))
+        points = points.T
+        points = points[mask.reshape(-1)]
+        cloud = self.project_image_to_velo(points)
+        return cloud
+
+    def filter_cloud(self, cloud):
+        min_mask = cloud >= [-1.2,-0.2,0.0]
+        min_mask = min_mask[:, 0] & min_mask[:, 1] & min_mask[:, 2]
+        max_mask = cloud <= [1.2,1.0,2.4]
+        max_mask = max_mask[:, 0] & max_mask[:, 1] & max_mask[:, 2]
+        filter_mask = min_mask & max_mask
+        filtered_cloud = cloud[filter_mask]
+        return filtered_cloud
+
+    def calc_voxel_grid(self, filtered_cloud, voxel_size):
+        xyz_q = np.floor(np.array(filtered_cloud/voxel_size)).astype(int) # quantized point values, here you will loose precision
+        vox_grid = np.zeros((int(2.4/voxel_size)+1, int(1.2/voxel_size)+1, int(2.4/voxel_size)+1)) #Empty voxel grid
+        offsets = np.array([-xyz_q[:,0].min(), -xyz_q[:,1].min(), -xyz_q[:,2].min()])
+        xyz_offset_q = xyz_q+offsets
+        vox_grid[xyz_offset_q[:,0],xyz_offset_q[:,1],xyz_offset_q[:,2]] = 1 # Setting all voxels containitn a points equal to 1
+
+        xyz_v = np.asarray(np.where(vox_grid == 1)) # get back indexes of populated voxels
+        cloud_np = np.asarray([(pt-offsets)*voxel_size for pt in xyz_v.T])
+        return vox_grid, cloud_np
+
+    def __len__(self):
+        return len(self.left_filenames)
+
+    def __getitem__(self, index):
+        left_img = self.load_image(os.path.join(self.datapath, self.left_filenames[index]))
+        right_img = self.load_image(os.path.join(self.datapath, self.right_filenames[index]))
+        disparity = self.load_disp(os.path.join(self.datapath, self.disp_filenames[index]))
+
+        if "15mm_focallength" in self.left_filenames[index]:
+            self.f_u = 450.0
+            self.f_v = 450.0
+        else:
+            self.f_u = 1050.0
+            self.f_v = 1050.0
+
+        if self.training:
+            w, h = left_img.size
+            crop_w, crop_h = 512, 256
+
+            x1 = random.randint(0, w - crop_w)
+            y1 = random.randint(0, h - crop_h)
+
+            # random crop
+            left_img = left_img.crop((x1, y1, x1 + crop_w, y1 + crop_h))
+            right_img = right_img.crop((x1, y1, x1 + crop_w, y1 + crop_h))
+            disparity = disparity[y1:y1 + crop_h, x1:x1 + crop_w]
+
+            # to tensor, normalize
+            processed = get_transform()
+            left_img = processed(left_img)
+            right_img = processed(right_img)
+
+            return {"left": left_img,
+                    "right": right_img,
+                    "disparity": disparity}
+        else:
+            w, h = left_img.size
+            crop_w, crop_h = 960, 512
+
+            left_img = left_img.crop((w - crop_w, h - crop_h, w, h))
+            right_img = right_img.crop((w - crop_w, h - crop_h, w, h))
+            disparity = disparity[h - crop_h:h, w - crop_w: w]
+
+            processed = get_transform()
+            left_img = processed(left_img)
+            right_img = processed(right_img)
+
+            # calcualte depth for ground truth disparity map
+            mask = disparity > 0
+            depth_gt = self.f_u * self.baseline / (disparity + 1. - mask)
+            vox_grid_gt = torch.zeros((int(2.4/self.voxel_size)+1, int(1.2/self.voxel_size)+1, int(2.4/self.voxel_size)+1))
+            try:
+                cloud_gt = self.calc_cloud(disparity, depth_gt)
+                filtered_cloud_gt = self.filter_cloud(cloud_gt)
+                vox_grid_gt,cloud_np_gt  = self.calc_voxel_grid(filtered_cloud_gt, voxel_size=self.voxel_size)
+                vox_grid_gt = torch.from_numpy(vox_grid_gt)
+            except Exception as e:
+                pass
+
+            return {"left": left_img,
+                    "right": right_img,
+                    "disparity": disparity,
+                    "voxel_grid": vox_grid_gt,
+                    "top_pad": 0,
+                    "right_pad": 0,
+                    "left_filename": self.left_filenames[index]}
 
 class KITTIDataset(Dataset):
     def __init__(self, datapath, list_filename, training):
